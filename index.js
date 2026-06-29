@@ -34,6 +34,7 @@ async function run() {
     const proposalCollection = database.collection("proposals");
     const userCollection = database.collection("user");
     const ratingCollection = database.collection("ratings");
+    const paymentCollection = database.collection("payments");
 
 
     // ─────────────────────────────────────────────
@@ -60,6 +61,54 @@ async function run() {
         }
         const result = await taskCollection.find(query).toArray();
         res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: error.message });
+      }
+    });
+
+    // GET /tasks-pagination — server-side paginated, searchable & filterable task list
+    // Query params: page (default 1), limit (default 9), search (title/desc), category
+    app.get('/tasks-pagination', async (req, res) => {
+      try {
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 9, 1), 50);
+        const search = (req.query.search || '').trim();
+        const category = (req.query.category || 'All').trim();
+
+        // Build the query — only browsable tasks (exclude completed)
+        const query = { status: { $ne: 'Completed' } };
+
+        if (category && category !== 'All') {
+          query.category = category;
+        }
+
+        if (search) {
+          // Case-insensitive search across title and description
+          const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          query.$or = [
+            { title: { $regex: escaped, $options: 'i' } },
+            { description: { $regex: escaped, $options: 'i' } },
+          ];
+        }
+
+        const skip = (page - 1) * limit;
+
+        const [total, tasks] = await Promise.all([
+          taskCollection.countDocuments(query),
+          taskCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+        ]);
+
+        const totalPages = Math.ceil(total / limit);
+
+        res.send({
+          tasks,
+          page,
+          limit,
+          total,
+          totalPages,
+          hasNextPage: page < totalPages,
+          hasPrevPage: page > 1,
+        });
       } catch (error) {
         res.status(500).send({ message: error.message });
       }
@@ -172,10 +221,14 @@ async function run() {
     app.patch('/proposals/:id', async (req, res) => {
       try {
         const id = req.params.id;
-        const { status } = req.body; // 'accepted' | 'declined' | 'pending' | 'rejected'
+        const { status, clientComment } = req.body; // 'accepted' | 'declined' | 'pending' | 'rejected'
 
         const filter = { _id: new ObjectId(id) };
-        const updateDoc = { $set: { status } };
+        const fields = { status };
+        if (clientComment !== undefined) {
+          fields.clientComment = clientComment;
+        }
+        const updateDoc = { $set: fields };
         const result = await proposalCollection.updateOne(filter, updateDoc);
         res.send(result);
       } catch (error) {
@@ -318,6 +371,135 @@ async function run() {
         }
         const result = await ratingCollection.find(query).sort({ createdAt: -1 }).toArray();
         res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: error.message });
+      }
+    });
+
+    // ─────────────────────────────────────────────
+    // PAYMENTS endpoints (Stripe transaction records)
+    // ─────────────────────────────────────────────
+
+    // POST /payments — record a completed Stripe checkout transaction
+    app.post('/payments', async (req, res) => {
+      try {
+        const {
+          taskId,
+          taskTitle,
+          proposalId,
+          clientEmail,
+          clientName,
+          freelancerEmail,
+          freelancerName,
+          amount,
+          transactionId,
+          paymentStatus = 'paid',
+        } = req.body;
+
+        // Basic validation
+        if (!clientEmail || !freelancerEmail || !taskId) {
+          return res.status(400).send({ message: 'taskId, clientEmail and freelancerEmail are required.' });
+        }
+
+        const payment = {
+          taskId,
+          taskTitle: taskTitle || '',
+          proposalId: proposalId || '',
+          clientEmail,
+          clientName: clientName || '',
+          freelancerEmail,
+          freelancerName: freelancerName || '',
+          amount: parseFloat(amount) || 0,
+          transactionId: transactionId || `ss_${Date.now()}`,
+          paymentStatus,
+          paidAt: new Date(),
+        };
+
+        // Prevent duplicate payment for the same proposal
+        if (proposalId) {
+          const existing = await paymentCollection.findOne({ proposalId });
+          if (existing) {
+            return res.status(409).send({ message: 'Payment already recorded for this proposal.', payment: existing });
+          }
+        }
+
+        const result = await paymentCollection.insertOne(payment);
+        res.status(201).send(result);
+      } catch (error) {
+        res.status(500).send({ message: error.message });
+      }
+    });
+
+    // GET /payments — list payments (optionally filter by clientEmail / freelancerEmail)
+    app.get('/payments', async (req, res) => {
+      try {
+        const { clientEmail, freelancerEmail } = req.query;
+        const query = {};
+        if (clientEmail) query.clientEmail = clientEmail;
+        if (freelancerEmail) query.freelancerEmail = freelancerEmail;
+
+        const result = await paymentCollection.find(query).sort({ paidAt: -1 }).toArray();
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: error.message });
+      }
+    });
+
+    // ─────────────────────────────────────────────
+    // STATS endpoint (platform-wide metrics)
+    // ─────────────────────────────────────────────
+
+    app.get('/stats', async (req, res) => {
+      try {
+        const [
+          totalTasks,
+          openTasks,
+          inProgressTasks,
+          allUsers,
+          allProposals,
+          budgetAgg,
+          ratingAgg,
+          allPayments,
+          revenueAgg,
+        ] = await Promise.all([
+          taskCollection.countDocuments(),
+          taskCollection.countDocuments({ status: { $in: ['Open', 'open'] } }),
+          taskCollection.countDocuments({ status: 'In Progress' }),
+          userCollection.find({}).toArray(),
+          proposalCollection.countDocuments(),
+          taskCollection.aggregate([
+            { $group: { _id: null, total: { $sum: '$budget' } } }
+          ]).toArray(),
+          ratingCollection.aggregate([
+            { $group: { _id: null, avg: { $avg: '$rating' }, count: { $sum: 1 } } }
+          ]).toArray(),
+          paymentCollection.find({}).toArray(),
+          paymentCollection.aggregate([
+            { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }
+          ]).toArray(),
+        ]);
+
+        const freelancers = allUsers.filter(u => u.role === 'freelancer' && !u.isBlocked);
+        const clients = allUsers.filter(u => u.role === 'client' || u.role === 'Client');
+        const blockedUsers = allUsers.filter(u => u.isBlocked);
+
+        res.send({
+          totalTasks,
+          openTasks,
+          inProgressTasks,
+          activeTasks: openTasks + inProgressTasks,
+          totalFreelancers: freelancers.length,
+          totalClients: clients.length,
+          totalUsers: allUsers.length,
+          blockedUsers: blockedUsers.length,
+          totalProposals: allProposals,
+          totalPaidOut: budgetAgg[0]?.total || 0,
+          // Real revenue = sum of recorded successful payments
+          totalRevenue: revenueAgg[0]?.total || 0,
+          totalTransactions: revenueAgg[0]?.count || allPayments.length,
+          avgRating: ratingAgg[0]?.avg ? parseFloat(ratingAgg[0].avg.toFixed(1)) : 4.9,
+          totalRatings: ratingAgg[0]?.count || 0,
+        });
       } catch (error) {
         res.status(500).send({ message: error.message });
       }
