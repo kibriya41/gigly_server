@@ -248,10 +248,7 @@ async function run() {
       }
     });
 
-    // ─────────────────────────────────────────────
-    // USERS endpoints (MongoDB for profiles + admin)
-    // ─────────────────────────────────────────────
-
+    
     // GET /users — get all platform users (Client / Freelancer / Admin)
     app.get('/users', async (req, res) => {
       try {
@@ -316,9 +313,7 @@ async function run() {
       }
     });
 
-    // ─────────────────────────────────────────────
-    // RATINGS endpoints
-    // ─────────────────────────────────────────────
+    
 
     // POST /ratings — submit a new rating
     app.post('/ratings', async (req, res) => {
@@ -376,10 +371,7 @@ async function run() {
       }
     });
 
-    // ─────────────────────────────────────────────
-    // PAYMENTS endpoints (Stripe transaction records)
-    // ─────────────────────────────────────────────
-
+   
     // POST /payments — record a completed Stripe checkout transaction
     app.post('/payments', async (req, res) => {
       try {
@@ -506,7 +498,7 @@ async function run() {
     });
 
     // Send a ping to confirm a successful connection
-    await client.db("admin").command({ ping: 1 });
+    // await client.db("admin").command({ ping: 1 });
     console.log("Pinged your deployment. You successfully connected to MongoDB!");
   } finally {
     // Ensures that the client will close when you finish/error
